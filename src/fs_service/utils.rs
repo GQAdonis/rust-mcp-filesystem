@@ -1,9 +1,8 @@
 use crate::error::{ServiceError, ServiceResult};
-use base64::{engine::general_purpose, write::EncoderWriter};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Local};
 use dirs::home_dir;
 use rust_mcp_sdk::macros::JsonSchema;
-use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
@@ -13,11 +12,6 @@ use std::{
     fs::{self},
     path::{Component, Path, PathBuf, Prefix},
     time::SystemTime,
-};
-use tokio::io::AsyncReadExt;
-use tokio::{
-    fs::{File, metadata},
-    io::BufReader,
 };
 
 #[cfg(windows)]
@@ -71,8 +65,173 @@ pub fn format_permissions(metadata: &fs::Metadata) -> String {
     }
 }
 
-pub fn normalize_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+pub fn normalize_windows_drive_path(path: &Path) -> PathBuf {
+    let path_text = path.to_string_lossy();
+    let Some((drive, rest)) = split_windows_drive_path(&path_text) else {
+        return path.to_path_buf();
+    };
+
+    windows_drive_path_buf(drive, &rest)
+}
+
+fn split_windows_drive_path(input: &str) -> Option<(char, String)> {
+    let normalized = input.trim().replace('\\', "/");
+    let without_leading_slash = normalized.strip_prefix('/').unwrap_or(&normalized);
+    let bytes = without_leading_slash.as_bytes();
+
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'/' {
+        return None;
+    }
+
+    Some((
+        (bytes[0] as char).to_ascii_uppercase(),
+        without_leading_slash[3..]
+            .trim_start_matches('/')
+            .to_string(),
+    ))
+}
+
+#[cfg(windows)]
+fn windows_drive_path_buf(drive: char, rest: &str) -> PathBuf {
+    if rest.is_empty() {
+        PathBuf::from(format!("{drive}:/"))
+    } else {
+        PathBuf::from(format!("{drive}:/{rest}"))
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_drive_path_buf(drive: char, rest: &str) -> PathBuf {
+    use std::sync::LazyLock;
+    static MOUNT_ROOT: LazyLock<String> = LazyLock::new(|| {
+        for candidate in ["/mnt", "/cygdrive", ""] {
+            if Path::new(&format!("{candidate}/c")).exists() {
+                return candidate.to_string();
+            }
+        }
+        "/mnt".to_string()
+    });
+
+    let drive = drive.to_ascii_lowercase();
+    let root = &*MOUNT_ROOT;
+    if rest.is_empty() {
+        PathBuf::from(format!("{root}/{drive}"))
+    } else {
+        PathBuf::from(format!("{root}/{drive}/{rest}"))
+    }
+}
+
+/// Returns `true` when `path` refers to a Windows UNC share
+/// (`\\server\share` or the verbatim `\\?\UNC\server\share` form).
+///
+/// On macOS/Linux `std::path` never produces `Prefix` components, so this is
+/// always `false` there (a `\\server\share` string is just an ordinary file
+/// name).
+pub fn is_unc_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(p))
+            if matches!(p.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    )
+}
+
+/// Strips the Windows extended-length (`\\?\`) prefix from a canonical path so
+/// that it is human-friendly and usable for prefix matching:
+///
+/// - `\\?\UNC\server\share\dir` → `\\server\share\dir`
+/// - `\\?\C:\foo` → `C:\foo`
+/// - anything else → unchanged
+///
+/// This is purely cosmetic/normalization; the verbatim form is still used for
+/// the actual `std::fs` system calls (to preserve long-path support).
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path.to_path_buf();
+    };
+    if let Some(unc) = rest.strip_prefix("UNC\\") {
+        PathBuf::from(format!("\\\\{unc}"))
+    } else {
+        PathBuf::from(rest)
+    }
+}
+
+/// Removes trailing separators from `path`, without ever dropping a root
+/// component (e.g. `C:\` must not become `C:`). Used to deduplicate allowed
+/// roots such as `\\server\share` vs `\\server\share\`.
+pub fn trim_trailing_separator(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches('\\').trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.len() == text.len() {
+        return path;
+    }
+    let candidate = PathBuf::from(trimmed);
+    let had_root = path.components().any(|c| matches!(c, Component::RootDir));
+    let has_root = candidate
+        .components()
+        .any(|c| matches!(c, Component::RootDir));
+    if had_root && !has_root {
+        path
+    } else {
+        candidate
+    }
+}
+
+/// Strips `base` from `path` as a prefix, returning the relative remainder.
+///
+/// On Windows comparison is case-insensitive (UNC server/share names and the
+/// filesystem are case-insensitive), on macOS/Linux it is case-sensitive so
+/// that mounted `C:` roots under `/mnt/c` keep exact matching.
+pub fn strip_prefix_platform(path: &Path, base: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        strip_prefix_ci(path, base)
+    }
+    #[cfg(not(windows))]
+    {
+        path.strip_prefix(base).ok().map(Path::to_path_buf)
+    }
+}
+
+/// Case-insensitive, component-wise `strip_prefix` for Windows.
+#[cfg(windows)]
+fn strip_prefix_ci(path: &Path, base: &Path) -> Option<PathBuf> {
+    let base_components: Vec<Component<'_>> = base.components().collect();
+    let path_components: Vec<Component<'_>> = path.components().collect();
+    if path_components.len() < base_components.len() {
+        return None;
+    }
+
+    for (base_component, path_component) in base_components.iter().zip(path_components.iter()) {
+        let equal = match (base_component, path_component) {
+            (Component::Prefix(base_prefix), Component::Prefix(path_prefix)) => {
+                match (base_prefix.kind(), path_prefix.kind()) {
+                    (Prefix::UNC(a, b), Prefix::UNC(c, d))
+                    | (Prefix::VerbatimUNC(a, b), Prefix::VerbatimUNC(c, d)) => {
+                        a.eq_ignore_ascii_case(c) && b.eq_ignore_ascii_case(d)
+                    }
+                    (Prefix::Disk(a), Prefix::Disk(c))
+                    | (Prefix::VerbatimDisk(a), Prefix::VerbatimDisk(c)) => {
+                        a.eq_ignore_ascii_case(&c)
+                    }
+                    _ => false,
+                }
+            }
+            (Component::RootDir, Component::RootDir) => true,
+            (Component::Normal(a), Component::Normal(c)) => a.eq_ignore_ascii_case(c),
+            (Component::CurDir, Component::CurDir) => true,
+            _ => false,
+        };
+        if !equal {
+            return None;
+        }
+    }
+
+    let mut rel = PathBuf::new();
+    for component in &path_components[base_components.len()..] {
+        rel.push(component.as_os_str());
+    }
+    Some(rel)
 }
 
 pub fn expand_home(path: PathBuf) -> PathBuf {
@@ -105,41 +264,6 @@ pub fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-// checks if path component is a  Prefix::VerbatimDisk
-fn is_verbatim_disk(component: &Component) -> bool {
-    match component {
-        Component::Prefix(prefix_comp) => matches!(prefix_comp.kind(), Prefix::VerbatimDisk(_)),
-        _ => false,
-    }
-}
-
-/// Check path contains a symlink
-pub fn contains_symlink<P: AsRef<Path>>(path: P) -> std::io::Result<bool> {
-    let mut current_path = PathBuf::new();
-
-    for component in path.as_ref().components() {
-        current_path.push(component);
-
-        // no need to check symlink_metadata for Prefix::VerbatimDisk
-        if is_verbatim_disk(&component) {
-            continue;
-        }
-
-        if !current_path.exists() {
-            break;
-        }
-
-        if fs::symlink_metadata(&current_path)?
-            .file_type()
-            .is_symlink()
-        {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
 /// Checks if a given filename is a system metadata file commonly
 /// used by operating systems to store folder metadata.
 ///
@@ -149,35 +273,6 @@ pub fn contains_symlink<P: AsRef<Path>>(path: P) -> std::io::Result<bool> {
 ///
 pub fn is_system_metadata_file(filename: &OsStr) -> bool {
     filename == ".DS_Store" || filename == "Thumbs.db"
-}
-
-// reads file as base64 efficiently in a streaming manner
-pub async fn read_file_as_base64(file_path: &Path) -> ServiceResult<String> {
-    let file = File::open(file_path).await?;
-    let mut reader = BufReader::new(file);
-
-    let mut output = Vec::new();
-    {
-        // Wrap output Vec<u8> in a Base64 encoder writer
-        let mut encoder = EncoderWriter::new(&mut output, &general_purpose::STANDARD);
-
-        let mut buffer = [0u8; 8192];
-        loop {
-            let n = reader.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }
-            // Write raw bytes to the Base64 encoder
-            encoder.write_all(&buffer[..n])?;
-        }
-        // Make sure to flush any remaining bytes
-        encoder.flush()?;
-    } // drop encoder before consuming output
-
-    // Convert the Base64 bytes to String (safe UTF-8)
-    let base64_string =
-        String::from_utf8(output).map_err(|err| ServiceError::FromString(format!("{err}")))?;
-    Ok(base64_string)
 }
 
 pub fn detect_line_ending(text: &str) -> &str {
@@ -190,7 +285,7 @@ pub fn detect_line_ending(text: &str) -> &str {
     }
 }
 
-pub fn mime_from_path(path: &Path) -> ServiceResult<infer::Type> {
+pub fn mime_from_bytes(bytes: &[u8], path: &Path) -> ServiceResult<infer::Type> {
     let is_svg = path
         .extension()
         .is_some_and(|e| e.to_str().is_some_and(|s| s == "svg"));
@@ -202,13 +297,14 @@ pub fn mime_from_path(path: &Path) -> ServiceResult<infer::Type> {
             "svg",
             |_: &[u8]| true,
         ));
-
-        // infer::Type::new(infer::MatcherType::Image, "", "svg",);
     }
-    let kind = infer::get_from_path(path)?.ok_or(ServiceError::FromString(
-        "File tyle is unknown!".to_string(),
-    ))?;
-    Ok(kind)
+    infer::get(bytes).ok_or(ServiceError::FromString(
+        "File type is unknown!".to_string(),
+    ))
+}
+
+pub fn encode_base64(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
 }
 
 pub fn escape_regex(text: &str) -> String {
@@ -240,27 +336,204 @@ pub fn filesize_in_range(file_size: u64, min_bytes: Option<u64>, max_bytes: Opti
     }
 }
 
-pub async fn validate_file_size<P: AsRef<Path>>(
-    path: P,
-    min_bytes: Option<usize>,
-    max_bytes: Option<usize>,
-) -> ServiceResult<()> {
-    if min_bytes.is_none() && max_bytes.is_none() {
-        return Ok(());
-    }
-
-    let file_size = metadata(&path).await?.len() as usize;
-
-    match (min_bytes, max_bytes) {
-        (_, Some(max)) if file_size > max => Err(ServiceError::FileTooLarge(max)),
-        (Some(min), _) if file_size < min => Err(ServiceError::FileTooSmall(min)),
-        _ => Ok(()),
-    }
-}
-
 /// Converts a string to a `PathBuf`, supporting both raw paths and `file://` URIs.
 pub fn parse_file_path(input: &str) -> ServiceResult<PathBuf> {
-    Ok(PathBuf::from(
-        input.strip_prefix("file://").unwrap_or(input).trim(),
-    ))
+    let raw = input.strip_prefix("file://").unwrap_or(input).trim();
+    Ok(normalize_windows_drive_path(Path::new(raw)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_windows_drive_edge_cases() {
+        // None cases
+        assert!(split_windows_drive_path("").is_none());
+        assert!(split_windows_drive_path("C:foo").is_none());
+        assert!(split_windows_drive_path("1:/foo").is_none());
+        assert!(split_windows_drive_path("CC:/foo").is_none());
+        assert!(split_windows_drive_path("/foo/bar").is_none());
+        assert!(split_windows_drive_path("/C:").is_none());
+        assert!(split_windows_drive_path(r"\\?\C:\foo").is_none());
+
+        // Success cases
+        assert_eq!(
+            split_windows_drive_path("C:/Users/Peter"),
+            Some(('C', "Users/Peter".to_string()))
+        );
+        assert_eq!(
+            split_windows_drive_path("/C:/Users/Peter"),
+            Some(('C', "Users/Peter".to_string()))
+        );
+        assert_eq!(
+            split_windows_drive_path(r"c:\Users\Peter"),
+            Some(('C', "Users/Peter".to_string()))
+        );
+        assert_eq!(
+            split_windows_drive_path("/c:/"),
+            Some(('C', "".to_string()))
+        );
+        assert_eq!(split_windows_drive_path("Z:/"), Some(('Z', "".to_string())));
+    }
+
+    #[test]
+    fn test_is_unc_path() {
+        #[cfg(windows)]
+        {
+            assert!(is_unc_path(Path::new(r"\\server\share")));
+            assert!(is_unc_path(Path::new(r"\\?\UNC\server\share")));
+            assert!(is_unc_path(Path::new(r"\\server\share\folder")));
+            assert!(!is_unc_path(Path::new(r"C:\foo")));
+            assert!(!is_unc_path(Path::new(r"\\?\C:\foo")));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(!is_unc_path(Path::new(r"\\server\share")));
+            assert!(!is_unc_path(Path::new(r"\\?\UNC\server\share")));
+        }
+        assert!(!is_unc_path(Path::new("/foo/bar")));
+        assert!(!is_unc_path(Path::new("")));
+    }
+
+    #[test]
+    fn test_strip_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\MEDIASERVER\Movies")),
+            PathBuf::from(r"\\MEDIASERVER\Movies")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\sub\file.txt")),
+            PathBuf::from(r"\\server\share\sub\file.txt")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\foo")),
+            PathBuf::from(r"C:\foo")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\server\share")),
+            PathBuf::from(r"\\server\share")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"C:\foo")),
+            PathBuf::from(r"C:\foo")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new("/mnt/c/foo")),
+            PathBuf::from("/mnt/c/foo")
+        );
+    }
+
+    #[test]
+    fn test_trim_trailing_separator() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                trim_trailing_separator(PathBuf::from(r"C:\Users\Peter\")),
+                PathBuf::from(r"C:\Users\Peter")
+            );
+            assert_eq!(
+                trim_trailing_separator(PathBuf::from(r"\\server\share\")),
+                PathBuf::from(r"\\server\share")
+            );
+            // Production pipeline: de-verbatimize, then trim.
+            assert_eq!(
+                trim_trailing_separator(strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\"))),
+                PathBuf::from(r"\\server\share")
+            );
+            assert_eq!(
+                trim_trailing_separator(PathBuf::from(r"C:\")),
+                PathBuf::from(r"C:\")
+            );
+            assert_eq!(
+                trim_trailing_separator(PathBuf::from(r"C:\Users\Peter")),
+                PathBuf::from(r"C:\Users\Peter")
+            );
+        }
+        assert_eq!(
+            trim_trailing_separator(PathBuf::from("/usr/local/")),
+            PathBuf::from("/usr/local")
+        );
+        assert_eq!(
+            trim_trailing_separator(PathBuf::from("/")),
+            PathBuf::from("/")
+        );
+        assert_eq!(
+            trim_trailing_separator(PathBuf::from("/usr/local")),
+            PathBuf::from("/usr/local")
+        );
+    }
+
+    #[test]
+    fn test_strip_prefix_platform() {
+        #[cfg(windows)]
+        {
+            // UNC, exact case.
+            assert_eq!(
+                strip_prefix_platform(
+                    Path::new(r"\\MEDIASERVER\Movies\sub\file.txt"),
+                    Path::new(r"\\MEDIASERVER\Movies")
+                ),
+                Some(PathBuf::from(r"sub\file.txt"))
+            );
+            // UNC, case-insensitive server + share + leaf.
+            assert_eq!(
+                strip_prefix_platform(
+                    Path::new(r"\\mediaserver\movies\FILE.txt"),
+                    Path::new(r"\\MEDIASERVER\Movies")
+                ),
+                Some(PathBuf::from("FILE.txt"))
+            );
+            // UNC, outside the share.
+            assert_eq!(
+                strip_prefix_platform(
+                    Path::new(r"\\other\share\file"),
+                    Path::new(r"\\MEDIASERVER\Movies")
+                ),
+                None
+            );
+            // Verbatim UNC input is de-verbatimized before matching.
+            let verbatim_path = strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\x"));
+            let verbatim_base = strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share"));
+            assert_eq!(
+                strip_prefix_platform(&verbatim_path, &verbatim_base),
+                Some(PathBuf::from("x"))
+            );
+            // Drive letter + component case-insensitive.
+            assert_eq!(
+                strip_prefix_platform(
+                    Path::new(r"c:\users\peter\file.txt"),
+                    Path::new(r"C:\Users\Peter")
+                ),
+                Some(PathBuf::from(r"file.txt"))
+            );
+            // Root drive match.
+            assert_eq!(
+                strip_prefix_platform(Path::new(r"C:\Users\Peter"), Path::new(r"C:\")),
+                Some(PathBuf::from(r"Users\Peter"))
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                strip_prefix_platform(
+                    Path::new("/mnt/c/Users/file.txt"),
+                    Path::new("/mnt/c/Users")
+                ),
+                Some(PathBuf::from("file.txt"))
+            );
+            // Case-sensitive on macOS/Linux.
+            assert_eq!(
+                strip_prefix_platform(
+                    Path::new("/mnt/C/Users/file.txt"),
+                    Path::new("/mnt/c/Users")
+                ),
+                None
+            );
+            assert_eq!(
+                strip_prefix_platform(Path::new("/etc/passwd"), Path::new("/mnt/c/Users")),
+                None
+            );
+        }
+    }
 }
