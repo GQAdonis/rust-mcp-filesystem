@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use walkdir::WalkDir;
 use zip::CompressionMethod;
-use zip::write::ZipWriter;
+use zip::write::{SimpleFileOptions, ZipWriter};
 
 fn format_bytes_size(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -95,8 +95,8 @@ impl FileSystemService {
         let zip_file_size = tokio::task::spawn_blocking(move || {
             let file = StdFile::create(&target_path_clone)?;
             let mut zip_writer = ZipWriter::new(file);
-            let options: zip::write::FileOptions<()> =
-                zip::write::FileOptions::default().compression_method(CompressionMethod::Deflated);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
             for entry_path_buf in &entries_clone {
                 if entry_path_buf.is_dir() {
@@ -179,8 +179,8 @@ impl FileSystemService {
         let zip_file_size = tokio::task::spawn_blocking(move || {
             let file = StdFile::create(&target_path_clone)?;
             let mut zip_writer = ZipWriter::new(file);
-            let options: zip::write::FileOptions<()> =
-                zip::write::FileOptions::default().compression_method(CompressionMethod::Deflated);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
             for path in &source_paths_clone {
                 let filename = path.file_name().ok_or(std::io::Error::new(

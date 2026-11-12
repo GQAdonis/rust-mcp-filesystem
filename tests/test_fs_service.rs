@@ -19,7 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::fs as tokio_fs;
-use zip::write::ZipWriter;
+use zip::write::{SimpleFileOptions, ZipWriter};
 
 use crate::common::create_sub_dir;
 use crate::common::create_test_file;
@@ -838,7 +838,7 @@ async fn test_write_zip_entry() {
     let result = tokio::task::spawn_blocking(move || {
         let file = StdFile::create(&zip_path).unwrap();
         let mut zip_writer = ZipWriter::new(file);
-        let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        let options = SimpleFileOptions::default();
 
         let mut input_file = StdFile::open(&input_path).unwrap();
         let mut buffer = Vec::new();
@@ -865,7 +865,7 @@ async fn test_write_zip_entry_non_existent_file() {
     let result = tokio::task::spawn_blocking(move || {
         let file = StdFile::create(&zip_path).unwrap();
         let mut zip_writer = ZipWriter::new(file);
-        let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        let options = SimpleFileOptions::default();
 
         let open_result = StdFile::open(&non_existent_path);
         if open_result.is_err() {
