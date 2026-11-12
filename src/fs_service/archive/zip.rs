@@ -7,7 +7,7 @@ use glob_match::glob_match;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zip::CompressionMethod;
-use zip::write::ZipWriter;
+use zip::write::{SimpleFileOptions, ZipWriter};
 
 fn format_bytes_size(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -79,8 +79,8 @@ impl FileSystemService {
         let zip_file_size = tokio::task::spawn_blocking(move || {
             let file = target_dir.create(&target_rel)?;
             let mut zip_writer = ZipWriter::new(file);
-            let options: zip::write::FileOptions<()> =
-                zip::write::FileOptions::default().compression_method(CompressionMethod::Deflated);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
             for entry_rel in &entries {
                 let rel_from_input = entry_rel
@@ -172,8 +172,8 @@ impl FileSystemService {
         let zip_file_size = tokio::task::spawn_blocking(move || {
             let file = target_dir.create(&target_rel)?;
             let mut zip_writer = ZipWriter::new(file);
-            let options: zip::write::FileOptions<()> =
-                zip::write::FileOptions::default().compression_method(CompressionMethod::Deflated);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
             for (dir, rel, filename) in &sources {
                 let mut input_file = dir.open(rel)?;
